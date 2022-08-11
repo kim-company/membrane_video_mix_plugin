@@ -157,7 +157,7 @@ defmodule Membrane.VideoMixer do
         %{pad | queue: FrameQueue.put_caps(queue, caps)}
       end)
 
-    {:ok, state}
+    {{:ok, redemand: :output}, state}
   end
 
   defp initialize_mixer_state(state = %{output_caps: caps, filters: filters}) do
