@@ -31,13 +31,13 @@ defmodule Membrane.VideoMixer.FrameQueueTest do
 
     assert 6 == FrameQueue.frames_length(queue)
     assert {{:change, "1"}, queue} = FrameQueue.get_frame(queue)
-    assert {{:no_change, "1"}, queue} = FrameQueue.get_frame(queue)
+    assert {{:ok, "1"}, queue} = FrameQueue.get_frame(queue)
     assert 4 == FrameQueue.frames_length(queue)
     assert {{:change, "2"}, queue} = FrameQueue.get_frame(queue)
-    assert {{:no_change, "2"}, queue} = FrameQueue.get_frame(queue)
+    assert {{:ok, "2"}, queue} = FrameQueue.get_frame(queue)
     assert 2 == FrameQueue.frames_length(queue)
     assert {{:change, "3"}, queue} = FrameQueue.get_frame(queue)
-    assert {{:no_change, "3"}, queue} = FrameQueue.get_frame(queue)
+    assert {{:ok, "3"}, queue} = FrameQueue.get_frame(queue)
     assert true == FrameQueue.empty?(queue)
   end
 end

@@ -11,24 +11,22 @@ defmodule Membrane.VideoMixer do
   alias Membrane.{Buffer, RawVideo, Time}
   alias Membrane.VideoMixer.{Mixer, FrameQueue}
 
-  def_options(
-    output_caps: [
-      type: :struct,
-      spec: RawVideo.t(),
-      description: """
-      Defines the caps of the output video.
-      """,
-      default: nil
-    ],
-    filters: [
-      type: :struct,
-      spec: (width :: integer, height :: integer, inputs :: integer -> String.t()),
-      description: """
-      Defines the filter building function.
-      """,
-      default: nil
-    ]
-  )
+  def_options output_caps: [
+                type: :struct,
+                spec: RawVideo.t(),
+                description: """
+                Defines the caps of the output video.
+                """,
+                default: nil
+              ],
+              filters: [
+                type: :struct,
+                spec: (width :: integer, height :: integer, inputs :: integer -> String.t()),
+                description: """
+                Defines the filter building function.
+                """,
+                default: nil
+              ]
 
   def_input_pad :input,
     mode: :pull,
@@ -49,7 +47,9 @@ defmodule Membrane.VideoMixer do
       |> Map.from_struct()
       |> Map.put(:pads, %{})
       |> Map.put(:mixer_state, nil)
-      |> put_time_information()
+      |> Map.put(:framerate, nil)
+      |> Map.put(:timer, nil)
+      |> Map.put(:frame_interval, nil)
       |> Map.update!(:filters, fn
         nil ->
           # default filters
@@ -67,17 +67,26 @@ defmodule Membrane.VideoMixer do
         other ->
           other
       end)
+      |> Map.put(:mixer_queue, %{caps_state: :ok, queue: %{}})
 
     {:ok, state}
   end
 
   @impl true
   def handle_pad_added(pad, _context, state) do
+    index = length(Map.keys(state.pads))
+
     state =
-      Bunch.Access.put_in(state, [:pads, pad], %{
+      state
+      |> Bunch.Access.put_in([:pads, pad], %{
         queue: FrameQueue.new(),
         stream_ended: false,
-        idx: length(Map.keys(state.pads))
+        idx: index
+      })
+      |> Bunch.Access.put_in([:mixer_queue, :queue, index], %{
+        ref: pad,
+        payload: nil,
+        expected_size: nil
       })
 
     {:ok, state}
@@ -111,31 +120,22 @@ defmodule Membrane.VideoMixer do
 
   @impl true
   def handle_start_of_stream(_pad, _context, state) do
-    mix_and_get_actions(state)
+    fill_and_mix(state)
   end
 
   @impl true
   def handle_end_of_stream(pad, _context, state) do
     index = Bunch.Access.get_in(state, [:pads, pad, :idx])
 
-    Membrane.Logger.debug("handle_end_of_stream: Pad nr. #{index + 1} stream ended")
+    Membrane.Logger.debug("handle_end_of_stream: Pad nr. #{index} stream ended")
 
-    state =
-      if FrameQueue.empty?(Bunch.Access.get_in(state, [:pads, pad, :queue])) do
-        # no frame for ended pad is in queue: remove it
-        Membrane.Logger.info("Pad nr: #{index + 1} stream ended and will be removed")
-
-        state = remove_pad(state, pad)
-        %{state | mixer_state: initialize_mixer_state(state)}
-      else
-        # pad will be removed as soon as its frame is empty
-        Bunch.Access.update_in(state, [:pads, pad], &%{&1 | stream_ended: true})
-      end
+    # pad will be removed as soon as its frame is empty
+    state = Bunch.Access.update_in(state, [:pads, pad], &%{&1 | stream_ended: true})
 
     if all_streams_ended?(state) do
       flush(state)
     else
-      mix_and_get_actions(state)
+      fill_and_mix(state)
     end
   end
 
@@ -147,124 +147,167 @@ defmodule Membrane.VideoMixer do
         %{pad | queue: FrameQueue.put_frame(queue, payload)}
       end)
 
-    mix_and_get_actions(state)
+    fill_and_mix(state)
   end
 
   @impl true
-  def handle_caps(pad_ref, caps, _context, state) do
+  def handle_caps(pad_ref, %RawVideo{framerate: {0, 1}}, _context, _state) do
+    raise RuntimeError, "received invalid caps on pad #{inspect(pad_ref)}. caps with dynamic framerate are not allowed."
+  end
+
+  def handle_caps(pad_ref, caps, context, %{framerate: nil} = state) do
+    case caps.framerate do
+      {0, 1} ->
+        raise RuntimeError, "received invalid caps on pad #{inspect(pad_ref)}. caps with dynamic framerate are not allowed."
+
+      {framerate, 1} ->
+        state =
+          state
+          |> Map.put(:framerate, {framerate, 1})
+          |> Map.put(:frame_interval, Time.second() / framerate)
+          |> Map.put(:timer, Time.seconds(0))
+
+        handle_caps(pad_ref, caps, context, state)
+
+      framerate ->
+        raise RuntimeError, "received invalid caps on pad #{inspect(pad_ref)}. only round framerates are allowed. received: #{inspect framerate}."
+    end
+  end
+
+  def handle_caps(pad_ref, %RawVideo{framerate: framerate} = caps, _context, %{framerate: framerate} = state) do
     state =
       Bunch.Access.update_in(state, [:pads, pad_ref], fn pad = %{queue: queue} ->
         %{pad | queue: FrameQueue.put_caps(queue, caps)}
       end)
 
-    {{:ok, redemand: :output}, state}
+    {:ok, state}
+  end
+
+  def handle_caps(pad_ref, %RawVideo{framerate: f1}, _context, %{framerate: f2}) do
+    raise RuntimeError, "received invalid caps on pad #{inspect(pad_ref)}. received: #{inspect f1}. expected: #{inspect f2}. The framerate must match."
   end
 
   defp initialize_mixer_state(state = %{output_caps: caps, filters: filters}) do
-    inputs_caps = get_ordered_caps(state)
+    input_caps = get_ordered_caps(state)
 
-    case length(inputs_caps) do
-      0 ->
-        Membrane.Logger.info("No inputs were found and mixer was set to empty state")
-        nil
+    mixer_state = Mixer.init(input_caps, caps, filters)
 
-      _ ->
-        Mixer.init(inputs_caps, caps, filters)
-    end
+    state
+    |> Map.put(:mixer_state, mixer_state)
+    |> put_expected_size(input_caps)
   end
 
-  defp mix_and_get_actions(%{pads: pads} = state) do
-    cond do
-      # no pads are present
-      no_streams?(state) ->
-        {{:ok, [end_of_stream: :output]}, state}
-
-      # one of the pad queues is empty, wait until we get an item
-      Enum.find_value(pads, fn {_pad_ref, %{queue: queue}} ->
-        FrameQueue.empty?(queue)
-      end) ->
-        {{:ok, [redemand: :output]}, state}
-
-      true ->
-        {payload, state} = mix(state)
-        buffer = %Buffer{payload: payload, pts: state.timer}
-
-        case remove_finished_pads(state) do
-          :keep ->
-            # no pad was removed
-            state = increment_timer(state)
-
-            {{:ok, [buffer: {:output, buffer}]}, state}
-
-          {:restart, state} ->
-            # pad was removed and the mixer needs to be restared
-            state =
-              state
-              |> Map.put(:mixer_state, initialize_mixer_state(state))
-              |> increment_timer()
-
-            {{:ok, [buffer: {:output, buffer}]}, state}
-
-          {:stop, state} ->
-            # last pad was removed
-            state =
-              state
-              |> Map.put(:mixer_state, initialize_mixer_state(state))
-              |> increment_timer()
-
-            {{:ok, [buffer: {:output, buffer}, end_of_stream: :output]}, state}
-        end
-    end
-  end
-
-  defp mix(state) do
-    case get_ordered_payloads(state) do
-      {:keep, payloads, state} ->
-        mix_payloads(payloads, state)
-
-      {:restart, payloads, state} ->
-        # caps were switched so the mixer needs to be restarted
-        state = %{state | mixer_state: initialize_mixer_state(state)}
-        mix_payloads(payloads, state)
-    end
-  end
-
-  defp get_ordered_payloads(%{pads: pads} = state) do
-    # get a frame from each pad queue and sort them
-    # can't be called when one of the queues is empty
-    {action, {pads, payloads_with_idx}} =
-      Enum.reduce(pads, {:keep, {[], []}}, fn
-        {pad_ref, pad = %{queue: queue, idx: idx}}, {:restart, {pads, payloads}} ->
-          {{_, payload}, queue} = FrameQueue.get_frame(queue)
-          pad = %{pad | queue: queue}
-
-          {:restart, {[{pad_ref, pad} | pads], [{idx, payload} | payloads]}}
-
-        {pad_ref, pad = %{queue: queue, idx: idx}}, {:keep, {pads, payloads}} ->
-          case FrameQueue.get_frame(queue) do
-            {{:no_change, payload}, queue} ->
-              pad = %{pad | queue: queue}
-
-              {:keep, {[{pad_ref, pad} | pads], [{idx, payload} | payloads]}}
-
-            {{:change, payload}, queue} ->
-              pad = %{pad | queue: queue}
-
-              {:restart, {[{pad_ref, pad} | pads], [{idx, payload} | payloads]}}
-          end
+  defp put_expected_size(state = %{mixer_queue: %{queue: queue}}, input_caps) do
+    queue =
+      input_caps
+      |> Enum.with_index()
+      |> Enum.reduce(queue, fn {caps, i}, queue ->
+        {:ok, size} = RawVideo.frame_size(caps)
+        Bunch.Access.put_in(queue, [i, :expected_size], size)
       end)
 
-    payloads =
-      payloads_with_idx
-      |> Enum.sort()
-      |> Enum.map(&elem(&1, 1))
+    Bunch.Access.put_in(state, [:mixer_queue, :queue], queue)
+  end
 
-    {action, payloads, %{state | pads: Map.new(pads)}}
+  defp fill_and_mix(state) do
+    {state, fill_action} = fill_inputs(state)
+
+    case fill_action do
+      :wait -> {{:ok, [redemand: :output]}, state}
+      :stop -> {{:ok, [end_of_stream: :output]}, state}
+      :ok -> mix_inputs(state)
+    end
+  end
+
+  defp fill_inputs(state) do
+    Enum.reduce(state.mixer_queue.queue, {state, :ok}, fn
+      {_idx, %{ref: ref, payload: nil}}, {state, state_action} ->
+        {result, state} =
+          Bunch.Access.get_and_update_in(state, [:pads, ref, :queue], &FrameQueue.get_frame(&1))
+
+        case result do
+          :empty ->
+            if Bunch.Access.get_in(state.pads, [ref, :stream_ended]) do
+              state = remove_pad(state, ref)
+
+              if length(Map.keys(state.pads)) == 0 do
+                {state, :stop}
+              else
+                {state, state_action}
+              end
+            else
+              {state, :wait}
+            end
+
+          {:ok, payload} ->
+            # get the new index if one of the pads was deleted
+            idx = Bunch.Access.get_in(state, [:pads, ref, :idx])
+
+            {Bunch.Access.put_in(state, [:mixer_queue, :queue, idx, :payload], payload),
+             state_action}
+
+          {:change, payload} ->
+            # get the new index if one of the pads was deleted
+            idx = Bunch.Access.get_in(state, [:pads, ref, :idx])
+
+            state =
+              state
+              |> Bunch.Access.put_in([:mixer_queue, :queue, idx, :payload], payload)
+              |> Bunch.Access.put_in([:mixer_queue, :caps_state], :restart)
+
+            {state, state_action}
+        end
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp mix_inputs(state = %{mixer_queue: %{caps_state: :restart}}) do
+    state
+    |> initialize_mixer_state()
+    |> Bunch.Access.put_in([:mixer_queue, :caps_state], :ok)
+    |> mix_inputs()
+  end
+
+  defp mix_inputs(state = %{mixer_queue: %{queue: queue}}) do
+    {queue, payloads, action} =
+      Enum.reduce(queue, {[], [], :ok}, fn {idx, item}, {queue, payloads, action} ->
+        action =
+          if byte_size(item.payload) == item.expected_size do
+            action
+          else
+            Membrane.Logger.warn(
+              "Input of size #{byte_size(item.payload)} was recieved while expected size is #{item.expected_size}\nInputs wil be discarded"
+            )
+
+            :drop
+          end
+
+        {[{idx, Map.put(item, :payload, nil)} | queue], [item.payload | payloads], action}
+      end)
+
+    state = Bunch.Access.put_in(state, [:mixer_queue, :queue], Map.new(queue))
+
+    case action do
+      :ok ->
+        payload =
+          payloads
+          |> Enum.reverse()
+          |> Mixer.mix(state.mixer_state)
+
+        buffer = %Buffer{payload: payload, pts: state.timer}
+        {{:ok, [buffer: {:output, buffer}]}, increment_timer(state)}
+
+      :drop ->
+        state
+        |> increment_timer()
+        |> fill_and_mix()
+    end
   end
 
   defp get_ordered_caps(%{pads: pads}) do
     pads
-    |> Enum.filter(fn {_ref, %{queue: queue}} -> FrameQueue.initialized?(queue) end)
     |> Enum.map(fn {_pad_ref, %{queue: queue, idx: index}} ->
       {index, FrameQueue.read_caps(queue)}
     end)
@@ -272,7 +315,7 @@ defmodule Membrane.VideoMixer do
     |> Enum.map(&elem(&1, 1))
   end
 
-  defp remove_pad(state = %{pads: pads}, pad_ref) do
+  defp remove_pad(state = %{pads: pads, mixer_queue: %{queue: queue}}, pad_ref) do
     # removes a pad and rearranges the index of the remaining ones
     index = Bunch.Access.get_in(state, [:pads, pad_ref, :idx])
 
@@ -287,50 +330,22 @@ defmodule Membrane.VideoMixer do
       end)
       |> Map.new()
 
+    queue =
+      if index <= length(Map.keys(pads)) - 2 do
+        index..(length(Map.keys(pads)) - 2)
+        |> Enum.reduce(queue, fn n, queue ->
+          Map.put(queue, n, queue[n + 1])
+        end)
+        |> Map.delete(length(Map.keys(pads)) - 1)
+      else
+        Map.delete(queue, length(Map.keys(pads)) - 1)
+      end
+
     state
     |> Map.put(:pads, pads)
     |> Bunch.Access.delete_in([:pads, pad_ref])
-  end
-
-  defp no_streams?(%{pads: pads}) do
-    Enum.empty?(Map.keys(pads))
-  end
-
-  defp remove_finished_pads(state = %{pads: pads}) do
-    # remove pads that have ended and where queue is empty
-    pads
-    |> Enum.reduce([], fn
-      {pad_ref, %{queue: queue, stream_ended: true}}, acc ->
-        if FrameQueue.empty?(queue) do
-          [pad_ref | acc]
-        else
-          acc
-        end
-
-      _, acc ->
-        acc
-    end)
-    |> case do
-      [] ->
-        :keep
-
-      to_remove ->
-        state =
-          Enum.reduce(to_remove, state, fn pad_ref, state ->
-            remove_pad(state, pad_ref)
-          end)
-
-        if no_streams?(state) do
-          {:stop, state}
-        else
-          {:restart, state}
-        end
-    end
-  end
-
-  defp mix_payloads(payloads, %{mixer_state: mixer_state} = state) do
-    payload = Mixer.mix(payloads, mixer_state)
-    {payload, state}
+    |> Bunch.Access.put_in([:mixer_queue, :queue], queue)
+    |> Bunch.Access.put_in([:mixer_queue, :caps_state], :restart)
   end
 
   defp all_streams_ended?(%{pads: pads}) do
@@ -341,32 +356,18 @@ defmodule Membrane.VideoMixer do
 
   defp flush(state, result \\ []) do
     # flush all frames that are in the queue
-    if no_streams?(state) do
-      end_flush(state, result)
-    else
-      {payload, state} = mix(state)
+    {state, fill_action} = fill_inputs(state)
 
-      case remove_finished_pads(state) do
-        :keep ->
-          # no pad was removed
-          state
-          |> increment_timer()
-          |> flush([%Buffer{payload: payload, pts: state.timer} | result])
+    case fill_action do
+      :ok ->
+        {{:ok, [buffer: {:output, buffer}]}, state} = mix_inputs(state)
+        flush(state, [buffer | result])
 
-        {:restart, state} ->
-          # pad was removed and the mixer needs to be restared
-          state
-          |> Map.put(:mixer_state, initialize_mixer_state(state))
-          |> increment_timer()
-          |> flush([%Buffer{payload: payload, pts: state.timer} | result])
+      :stop ->
+        end_flush(state, result)
 
-        {:stop, state} ->
-          # last pad was removed
-          state
-          |> Map.put(:mixer_state, initialize_mixer_state(state))
-          |> increment_timer()
-          |> end_flush([%Buffer{payload: payload, pts: state.timer} | result])
-      end
+      :wait ->
+        raise("this is a bug")
     end
   end
 
@@ -375,15 +376,6 @@ defmodule Membrane.VideoMixer do
   defp end_flush(state, buffers) do
     {{:ok, [buffer: {:output, Enum.reverse(buffers)}, end_of_stream: :output]}, state}
   end
-
-  defp put_time_information(state = %{output_caps: %{framerate: {framerate, 1}}}) do
-    state
-    |> Map.put(:frame_interval, Time.second() / framerate)
-    |> Map.put(:timer, Time.seconds(0))
-  end
-
-  defp put_time_information(%{output_caps: %{}}), do: raise("framerate not supported")
-  defp put_time_information(_), do: raise("output caps are required")
 
   defp increment_timer(state = %{timer: timer, frame_interval: interval}) do
     %{state | timer: timer + interval}

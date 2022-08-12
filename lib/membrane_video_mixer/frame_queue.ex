@@ -26,26 +26,27 @@ defmodule Membrane.VideoMixer.FrameQueue do
   end
 
   @doc """
-  Get a frame from the queue. The queue can't be empty when calling this function.
-  If the first item is empty, switches the current caps to the next one in the queue.
+  Get a frame from the queue. If the first item is empty, switches the current caps to the next one in the queue.
   """
-  @spec get_frame(t()) :: {{:no_change | :change, payload()}, t()}
-  def get_frame({{_, {[], []}}, []}), do: raise("should not have been called")
+  @spec get_frame(t()) :: {{:ok | :change, payload()} | :empty, t()}
+  def get_frame(queue = {{_, {[], []}}, []}), do: {:empty, queue}
 
-  def get_frame({{_caps, {[], []}}, back}) do
+  def get_frame(input = {{_caps, {[], []}}, back}) do
     [{caps, queue} | back] = Enum.reverse(back)
 
     case :queue.out(queue) do
-      {{:value, frame}, queue} -> {{:change, frame}, {{caps, queue}, Enum.reverse(back)}}
-      {:empty, _queue} -> get_frame({{caps, queue}, Enum.reverse(back)})
+      {{:value, frame}, queue} ->
+        {{:change, frame}, {{caps, queue}, Enum.reverse(back)}}
+
+      {:empty, _queue} ->
+        {:empty, input}
     end
   end
 
   def get_frame({{caps, queue}, back}) do
-    case :queue.out(queue) do
-      {{:value, frame}, queue} -> {{:no_change, frame}, {{caps, queue}, back}}
-      {:empty, _queue} -> raise "should not happen"
-    end
+    {{:value, frame}, queue} = :queue.out(queue)
+
+    {{:ok, frame}, {{caps, queue}, back}}
   end
 
   @doc "Read the first caps in the queue"
